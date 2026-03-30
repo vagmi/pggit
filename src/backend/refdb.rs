@@ -299,30 +299,27 @@ extern "C" fn pg_refdb_write(
         .unwrap_or("");
     let ref_type = unsafe { raw::git_reference_type(ref_) };
 
-    // For simplicity in Phase 2, we do the upsert directly.
-    // CAS checking (non-force mode) would require a transaction.
-    // The C code uses BEGIN/SELECT FOR UPDATE/UPSERT/COMMIT.
-    // We'll implement a simpler version that handles the common cases.
-
+    // Everything runs in a proper sqlx transaction. On success we call
+    // tx.commit(); on error the transaction is rolled back on drop.
     let result = store.rt_handle.block_on(async {
+        let mut tx = store.pool.begin().await?;
+
         if force == 0 {
-            // Check CAS constraints
-            let existing = queries::read_ref(&store.pool, pg.repo_id, ref_name).await;
+            // CAS check with SELECT FOR UPDATE to hold a row lock
+            let existing =
+                queries::read_ref_for_update(&mut tx, pg.repo_id, ref_name).await?;
 
             if !old.is_null() || !old_target.is_null() {
-                // Ref must exist for update
                 let row = match existing {
-                    Ok(row) => row,
-                    Err(crate::error::PgGitError::NotFound(_)) => {
+                    Some(row) => row,
+                    None => {
                         return Err(crate::error::PgGitError::NotFound(
                             format!("reference {} does not exist for update", ref_name),
                         ));
                     }
-                    Err(e) => return Err(e),
                 };
 
                 if !old.is_null() {
-                    // Check current OID matches expected
                     let old_oid = unsafe { &(&(*old).id)[..OID_SIZE] };
                     match &row.oid {
                         Some(cur_oid) if cur_oid.as_slice() == old_oid => {}
@@ -349,7 +346,7 @@ extern "C" fn pg_refdb_write(
                 }
             } else {
                 // Neither old nor old_target: ref must NOT exist
-                if existing.is_ok() {
+                if existing.is_some() {
                     return Err(crate::error::PgGitError::Other(
                         format!("reference {} already exists", ref_name),
                     ));
@@ -361,70 +358,26 @@ extern "C" fn pg_refdb_write(
         if ref_type == raw::GIT_REFERENCE_DIRECT {
             let oid = unsafe { raw::git_reference_target(ref_) };
             let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
-            queries::upsert_direct_ref(&store.pool, pg.repo_id, ref_name, oid_bytes).await?;
+            queries::tx_upsert_direct_ref(&mut tx, pg.repo_id, ref_name, oid_bytes)
+                .await?;
         } else {
-            let target = unsafe { CStr::from_ptr(raw::git_reference_symbolic_target(ref_)) }
-                .to_str()
-                .unwrap_or("");
-            queries::upsert_symbolic_ref(&store.pool, pg.repo_id, ref_name, target).await?;
+            let target =
+                unsafe { CStr::from_ptr(raw::git_reference_symbolic_target(ref_)) }
+                    .to_str()
+                    .unwrap_or("");
+            queries::tx_upsert_symbolic_ref(&mut tx, pg.repo_id, ref_name, target)
+                .await?;
         }
 
         // Write reflog entry if signature provided
         if !who.is_null() {
-            let sig = unsafe { &*who };
-            let sig_name = unsafe { CStr::from_ptr(sig.name) }.to_str().unwrap_or("");
-            let sig_email = unsafe { CStr::from_ptr(sig.email) }.to_str().unwrap_or("");
-            let committer = format!("{} <{}>", sig_name, sig_email);
-            let offset = sig.when.offset;
-            let tz = format!(
-                "{}{:02}{:02}",
-                if offset >= 0 { '+' } else { '-' },
-                offset.unsigned_abs() / 60,
-                offset.unsigned_abs() % 60,
-            );
-            let msg = if !message.is_null() {
-                Some(unsafe { CStr::from_ptr(message) }.to_str().unwrap_or(""))
-            } else {
-                None
-            };
-
-            let old_oid = if !old.is_null() {
-                let bytes = unsafe { &(&(*old).id)[..OID_SIZE] };
-                if bytes.iter().all(|&b| b == 0) {
-                    None
-                } else {
-                    Some(bytes as &[u8])
-                }
-            } else {
-                None
-            };
-
-            let new_oid = if ref_type == raw::GIT_REFERENCE_DIRECT {
-                let oid = unsafe { raw::git_reference_target(ref_) };
-                let bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
-                if bytes.iter().all(|&b| b == 0) {
-                    None
-                } else {
-                    Some(bytes as &[u8])
-                }
-            } else {
-                None
-            };
-
-            queries::write_reflog_entry(
-                &store.pool,
-                pg.repo_id,
-                ref_name,
-                old_oid,
-                new_oid,
-                &committer,
-                sig.when.time,
-                &tz,
-                msg,
+            write_reflog_in_tx(
+                &mut tx, pg.repo_id, ref_name, ref_type, ref_, who, old, message,
             )
             .await?;
         }
 
+        tx.commit().await?;
         Ok(())
     });
 
@@ -433,6 +386,55 @@ extern "C" fn pg_refdb_write(
         Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
         Err(_) => -1,
     }
+}
+
+/// Helper: write a reflog entry inside a transaction.
+async fn write_reflog_in_tx(
+    tx: &mut queries::PgTx<'_>,
+    repo_id: i32,
+    ref_name: &str,
+    ref_type: raw::git_reference_t,
+    ref_: *const raw::git_reference,
+    who: *const raw::git_signature,
+    old: *const raw::git_oid,
+    message: *const c_char,
+) -> crate::error::Result<()> {
+    let sig = unsafe { &*who };
+    let sig_name = unsafe { CStr::from_ptr(sig.name) }.to_str().unwrap_or("");
+    let sig_email = unsafe { CStr::from_ptr(sig.email) }.to_str().unwrap_or("");
+    let committer = format!("{} <{}>", sig_name, sig_email);
+    let offset = sig.when.offset;
+    let tz = format!(
+        "{}{:02}{:02}",
+        if offset >= 0 { '+' } else { '-' },
+        offset.unsigned_abs() / 60,
+        offset.unsigned_abs() % 60,
+    );
+    let msg = if !message.is_null() {
+        Some(unsafe { CStr::from_ptr(message) }.to_str().unwrap_or(""))
+    } else {
+        None
+    };
+
+    let old_oid = if !old.is_null() {
+        let bytes = unsafe { &(&(*old).id)[..OID_SIZE] };
+        if bytes.iter().all(|&b| b == 0) { None } else { Some(bytes as &[u8]) }
+    } else {
+        None
+    };
+
+    let new_oid = if ref_type == raw::GIT_REFERENCE_DIRECT {
+        let oid = unsafe { raw::git_reference_target(ref_) };
+        let bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+        if bytes.iter().all(|&b| b == 0) { None } else { Some(bytes as &[u8]) }
+    } else {
+        None
+    };
+
+    queries::tx_write_reflog_entry(
+        tx, repo_id, ref_name, old_oid, new_oid, &committer, sig.when.time, &tz, msg,
+    )
+    .await
 }
 
 extern "C" fn pg_refdb_rename(
@@ -592,11 +594,16 @@ extern "C" fn pg_refdb_reflog_delete(
     }
 }
 
-/// Lock payload for advisory locking.
+/// Lock payload: holds an open transaction with a transaction-scoped advisory lock.
+/// The lock is released automatically when the transaction commits or rolls back.
 struct PgRefLock {
-    lock_key: i64,
-    _refname: String,
+    /// The transaction holding the advisory lock. We store it as a raw pointer
+    /// because this payload crosses the C FFI boundary.
+    tx: *mut queries::PgTx<'static>,
 }
+
+// Safety: PgTx is Send, and we only access it from callbacks on blocking threads.
+unsafe impl Send for PgRefLock {}
 
 extern "C" fn pg_refdb_lock(
     payload_out: *mut *mut c_void,
@@ -606,18 +613,23 @@ extern "C" fn pg_refdb_lock(
     let pg = unsafe { get_backend(backend) };
     let store = pg.store();
     let name = unsafe { CStr::from_ptr(refname) }.to_str().unwrap_or("");
-
     let lock_key = hash_refname(pg.repo_id, name);
 
-    let result = store
-        .rt_handle
-        .block_on(queries::advisory_lock(&store.pool, lock_key));
+    let result = store.rt_handle.block_on(async {
+        let mut tx = store.pool.begin().await?;
+        queries::tx_advisory_lock(&mut tx, lock_key).await?;
+        Ok::<_, crate::error::PgGitError>(tx)
+    });
 
     match result {
-        Ok(()) => {
+        Ok(tx) => {
+            // Erase the lifetime to 'static so we can store it in the C payload.
+            // Safety: we guarantee the tx is used and dropped before the pool is.
+            let tx_box = Box::new(unsafe {
+                std::mem::transmute::<queries::PgTx<'_>, queries::PgTx<'static>>(tx)
+            });
             let lock = Box::new(PgRefLock {
-                lock_key,
-                _refname: name.to_string(),
+                tx: Box::into_raw(tx_box),
             });
             unsafe { *payload_out = Box::into_raw(lock) as *mut c_void };
             0
@@ -638,91 +650,55 @@ extern "C" fn pg_refdb_unlock(
     let pg = unsafe { get_backend(backend) };
     let store = pg.store();
     let lock = unsafe { Box::from_raw(payload as *mut PgRefLock) };
+    let mut tx = unsafe { Box::from_raw(lock.tx) };
 
-    let error = if success == 1 {
-        // Write/update the ref
-        let ref_name = unsafe { CStr::from_ptr(raw::git_reference_name(ref_)) }
-            .to_str()
-            .unwrap_or("");
-        let ref_type = unsafe { raw::git_reference_type(ref_) };
+    let result = store.rt_handle.block_on(async {
+        if success == 1 {
+            // Write/update the ref within the locked transaction
+            let ref_name = unsafe { CStr::from_ptr(raw::git_reference_name(ref_)) }
+                .to_str()
+                .unwrap_or("");
+            let ref_type = unsafe { raw::git_reference_type(ref_) };
 
-        store.rt_handle.block_on(async {
             if ref_type == raw::GIT_REFERENCE_DIRECT {
                 let oid = unsafe { raw::git_reference_target(ref_) };
                 let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
-                queries::upsert_direct_ref(&store.pool, pg.repo_id, ref_name, oid_bytes)
+                queries::tx_upsert_direct_ref(&mut tx, pg.repo_id, ref_name, oid_bytes)
                     .await?;
             } else {
                 let target =
                     unsafe { CStr::from_ptr(raw::git_reference_symbolic_target(ref_)) }
                         .to_str()
                         .unwrap_or("");
-                queries::upsert_symbolic_ref(&store.pool, pg.repo_id, ref_name, target)
+                queries::tx_upsert_symbolic_ref(&mut tx, pg.repo_id, ref_name, target)
                     .await?;
             }
 
             if update_reflog != 0 && !sig.is_null() {
-                let s = unsafe { &*sig };
-                let s_name = unsafe { CStr::from_ptr(s.name) }.to_str().unwrap_or("");
-                let s_email = unsafe { CStr::from_ptr(s.email) }.to_str().unwrap_or("");
-                let committer = format!("{} <{}>", s_name, s_email);
-                let offset = s.when.offset;
-                let tz = format!(
-                    "{}{:02}{:02}",
-                    if offset >= 0 { '+' } else { '-' },
-                    offset.unsigned_abs() / 60,
-                    offset.unsigned_abs() % 60,
-                );
-                let msg = if !message.is_null() {
-                    Some(unsafe { CStr::from_ptr(message) }.to_str().unwrap_or(""))
-                } else {
-                    None
-                };
-
-                let new_oid = if ref_type == raw::GIT_REFERENCE_DIRECT {
-                    let oid = unsafe { raw::git_reference_target(ref_) };
-                    Some(unsafe { &(&(*oid).id)[..OID_SIZE] } as &[u8])
-                } else {
-                    None
-                };
-
-                queries::write_reflog_entry(
-                    &store.pool,
-                    pg.repo_id,
-                    ref_name,
-                    None,
-                    new_oid,
-                    &committer,
-                    s.when.time,
-                    &tz,
-                    msg,
+                write_reflog_in_tx(
+                    &mut tx, pg.repo_id, ref_name, ref_type, ref_, sig, ptr::null(), message,
                 )
                 .await?;
             }
 
-            Ok::<(), crate::error::PgGitError>(())
-        })
-    } else if success == 2 {
-        // Delete the ref
-        let ref_name = unsafe { CStr::from_ptr(raw::git_reference_name(ref_)) }
-            .to_str()
-            .unwrap_or("");
-        store.rt_handle.block_on(async {
-            queries::delete_ref(&store.pool, pg.repo_id, ref_name).await?;
-            queries::delete_reflog(&store.pool, pg.repo_id, ref_name).await?;
-            Ok::<(), crate::error::PgGitError>(())
-        })
-    } else {
-        // success == 0: discard
-        Ok(())
-    };
+            // Commit: releases the advisory lock
+            tx.commit().await?;
+        } else if success == 2 {
+            // Delete the ref
+            let ref_name = unsafe { CStr::from_ptr(raw::git_reference_name(ref_)) }
+                .to_str()
+                .unwrap_or("");
+            queries::tx_delete_ref(&mut tx, pg.repo_id, ref_name).await?;
+            queries::tx_delete_reflog(&mut tx, pg.repo_id, ref_name).await?;
+            tx.commit().await?;
+        } else {
+            // success == 0: discard — tx drops and rolls back automatically
+        }
 
-    // Release the advisory lock
-    let _ = store
-        .rt_handle
-        .block_on(queries::advisory_unlock(&store.pool, lock.lock_key));
+        Ok::<(), crate::error::PgGitError>(())
+    });
 
-    match error {
+    match result {
         Ok(()) => 0,
         Err(_) => -1,
     }

@@ -1,4 +1,5 @@
 use std::os::raw::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
@@ -10,6 +11,11 @@ use crate::store::PgGitStore;
 const OID_SIZE: usize = raw::GIT_OID_RAWSZ;
 const OID_HEXSIZE: usize = raw::GIT_OID_HEXSZ;
 
+/// Wrap a callback body in catch_unwind to prevent panics unwinding through C.
+fn catch_panic(f: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
+    catch_unwind(f).unwrap_or(-1)
+}
+
 /// Custom ODB backend that stores git objects in PostgreSQL.
 ///
 /// Memory layout: starts with `git_odb_backend` so we can cast between them.
@@ -18,13 +24,10 @@ const OID_HEXSIZE: usize = raw::GIT_OID_HEXSZ;
 pub(crate) struct PostgresOdbBackend {
     pub parent: raw::git_odb_backend,
     store: *const PgGitStore,
-    /// We hold an Arc to prevent the store from being dropped while callbacks are alive.
     _prevent_drop: *const Arc<PgGitStore>,
     repo_id: i32,
 }
 
-// Safety: The PgGitStore contains a PgPool (Send+Sync) and a Handle (Send+Sync).
-// The raw pointers are only dereferenced in our callbacks which run on blocking threads.
 unsafe impl Send for PostgresOdbBackend {}
 unsafe impl Sync for PostgresOdbBackend {}
 
@@ -55,16 +58,10 @@ impl PostgresOdbBackend {
     }
 
     fn store(&self) -> &PgGitStore {
-        // Safety: store pointer is valid for the lifetime of this backend
-        // because we hold an Arc via _prevent_drop.
         unsafe { &*self.store }
     }
 }
 
-/// Helper to get our backend from the raw pointer.
-///
-/// # Safety
-/// The `backend` pointer must point to a valid `PostgresOdbBackend`.
 unsafe fn get_backend<'a>(backend: *mut raw::git_odb_backend) -> &'a PostgresOdbBackend {
     unsafe { &*(backend as *const PostgresOdbBackend) }
 }
@@ -76,30 +73,36 @@ extern "C" fn pg_odb_read(
     backend: *mut raw::git_odb_backend,
     oid: *const raw::git_oid,
 ) -> i32 {
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
-    let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+    catch_panic(AssertUnwindSafe(|| {
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
+        let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
 
-    let result =
-        store
-            .rt_handle
-            .block_on(queries::read_object(&store.pool, pg.repo_id, oid_bytes));
+        let result =
+            store
+                .rt_handle
+                .block_on(queries::read_object(&store.pool, pg.repo_id, oid_bytes));
 
-    match result {
-        Ok(row) => unsafe {
-            let buf = raw::git_odb_backend_data_alloc(backend, row.content.len());
-            if buf.is_null() {
-                return -1;
-            }
-            ptr::copy_nonoverlapping(row.content.as_ptr(), buf as *mut u8, row.content.len());
-            *data_p = buf;
-            *len_p = row.size as usize;
-            *type_p = row.object_type as raw::git_object_t;
-            0
-        },
-        Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
-        Err(_) => -1,
-    }
+        match result {
+            Ok(row) => unsafe {
+                let buf = raw::git_odb_backend_data_alloc(backend, row.content.len());
+                if buf.is_null() {
+                    return -1;
+                }
+                ptr::copy_nonoverlapping(
+                    row.content.as_ptr(),
+                    buf as *mut u8,
+                    row.content.len(),
+                );
+                *data_p = buf;
+                *len_p = row.size as usize;
+                *type_p = row.object_type as raw::git_object_t;
+                0
+            },
+            Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
+            Err(_) => -1,
+        }
+    }))
 }
 
 extern "C" fn pg_odb_read_header(
@@ -108,25 +111,27 @@ extern "C" fn pg_odb_read_header(
     backend: *mut raw::git_odb_backend,
     oid: *const raw::git_oid,
 ) -> i32 {
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
-    let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+    catch_panic(AssertUnwindSafe(|| {
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
+        let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
 
-    let result = store.rt_handle.block_on(queries::read_object_header(
-        &store.pool,
-        pg.repo_id,
-        oid_bytes,
-    ));
+        let result = store.rt_handle.block_on(queries::read_object_header(
+            &store.pool,
+            pg.repo_id,
+            oid_bytes,
+        ));
 
-    match result {
-        Ok((obj_type, size)) => unsafe {
-            *len_p = size as usize;
-            *type_p = obj_type as raw::git_object_t;
-            0
-        },
-        Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
-        Err(_) => -1,
-    }
+        match result {
+            Ok((obj_type, size)) => unsafe {
+                *len_p = size as usize;
+                *type_p = obj_type as raw::git_object_t;
+                0
+            },
+            Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
+            Err(_) => -1,
+        }
+    }))
 }
 
 extern "C" fn pg_odb_read_prefix(
@@ -138,47 +143,49 @@ extern "C" fn pg_odb_read_prefix(
     short_oid: *const raw::git_oid,
     prefix_len: usize,
 ) -> i32 {
-    // Full OID: use exact read
-    if prefix_len == OID_HEXSIZE {
-        let ret = pg_odb_read(data_p, len_p, type_p, backend, short_oid);
-        if ret == 0 {
-            unsafe {
-                (*out_oid).id = (*short_oid).id;
+    catch_panic(AssertUnwindSafe(|| {
+        if prefix_len == OID_HEXSIZE {
+            let ret = pg_odb_read(data_p, len_p, type_p, backend, short_oid);
+            if ret == 0 {
+                unsafe { (*out_oid).id = (*short_oid).id };
             }
+            return ret;
         }
-        return ret;
-    }
 
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
-    let byte_len = ((prefix_len + 1) / 2) as i32;
-    let prefix_bytes = unsafe { &(&(*short_oid).id)[..byte_len as usize] };
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
+        let byte_len = ((prefix_len + 1) / 2) as i32;
+        let prefix_bytes = unsafe { &(&(*short_oid).id)[..byte_len as usize] };
 
-    let result = store.rt_handle.block_on(queries::read_object_prefix(
-        &store.pool,
-        pg.repo_id,
-        prefix_bytes,
-        byte_len,
-    ));
+        let result = store.rt_handle.block_on(queries::read_object_prefix(
+            &store.pool,
+            pg.repo_id,
+            prefix_bytes,
+            byte_len,
+        ));
 
-    match result {
-        Ok(row) => unsafe {
-            ptr::copy_nonoverlapping(row.oid.as_ptr(), (*out_oid).id.as_mut_ptr(), OID_SIZE);
-
-            let buf = raw::git_odb_backend_data_alloc(backend, row.content.len());
-            if buf.is_null() {
-                return -1;
-            }
-            ptr::copy_nonoverlapping(row.content.as_ptr(), buf as *mut u8, row.content.len());
-            *data_p = buf;
-            *len_p = row.size as usize;
-            *type_p = row.object_type as raw::git_object_t;
-            0
-        },
-        Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
-        Err(crate::error::PgGitError::Ambiguous(_)) => raw::GIT_EAMBIGUOUS,
-        Err(_) => -1,
-    }
+        match result {
+            Ok(row) => unsafe {
+                ptr::copy_nonoverlapping(row.oid.as_ptr(), (*out_oid).id.as_mut_ptr(), OID_SIZE);
+                let buf = raw::git_odb_backend_data_alloc(backend, row.content.len());
+                if buf.is_null() {
+                    return -1;
+                }
+                ptr::copy_nonoverlapping(
+                    row.content.as_ptr(),
+                    buf as *mut u8,
+                    row.content.len(),
+                );
+                *data_p = buf;
+                *len_p = row.size as usize;
+                *type_p = row.object_type as raw::git_object_t;
+                0
+            },
+            Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
+            Err(crate::error::PgGitError::Ambiguous(_)) => raw::GIT_EAMBIGUOUS,
+            Err(_) => -1,
+        }
+    }))
 }
 
 extern "C" fn pg_odb_write(
@@ -188,40 +195,44 @@ extern "C" fn pg_odb_write(
     len: usize,
     obj_type: raw::git_object_t,
 ) -> i32 {
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
-    let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
-    let content = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+    catch_panic(AssertUnwindSafe(|| {
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
+        let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+        let content = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
 
-    let result = store.rt_handle.block_on(queries::write_object(
-        &store.pool,
-        pg.repo_id,
-        oid_bytes,
-        obj_type as i16,
-        len as i32,
-        content,
-    ));
+        let result = store.rt_handle.block_on(queries::write_object(
+            &store.pool,
+            pg.repo_id,
+            oid_bytes,
+            obj_type as i16,
+            len as i32,
+            content,
+        ));
 
-    match result {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
+        match result {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }))
 }
 
 extern "C" fn pg_odb_exists(backend: *mut raw::git_odb_backend, oid: *const raw::git_oid) -> i32 {
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
-    let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+    catch_panic(AssertUnwindSafe(|| {
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
+        let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
 
-    let result = store
-        .rt_handle
-        .block_on(queries::object_exists(&store.pool, pg.repo_id, oid_bytes));
+        let result = store
+            .rt_handle
+            .block_on(queries::object_exists(&store.pool, pg.repo_id, oid_bytes));
 
-    match result {
-        Ok(true) => 1,
-        Ok(false) => 0,
-        Err(_) => 0,
-    }
+        match result {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => 0,
+        }
+    }))
 }
 
 extern "C" fn pg_odb_exists_prefix(
@@ -230,41 +241,41 @@ extern "C" fn pg_odb_exists_prefix(
     short_oid: *const raw::git_oid,
     prefix_len: usize,
 ) -> i32 {
-    if prefix_len == OID_HEXSIZE {
-        if pg_odb_exists(backend, short_oid) == 0 {
-            return raw::GIT_ENOTFOUND;
+    catch_panic(AssertUnwindSafe(|| {
+        if prefix_len == OID_HEXSIZE {
+            if pg_odb_exists(backend, short_oid) == 0 {
+                return raw::GIT_ENOTFOUND;
+            }
+            unsafe { (*out_oid).id = (*short_oid).id };
+            return 0;
         }
-        unsafe {
-            (*out_oid).id = (*short_oid).id;
+
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
+        let byte_len = ((prefix_len + 1) / 2) as i32;
+        let prefix_bytes = unsafe { &(&(*short_oid).id)[..byte_len as usize] };
+
+        let result = store.rt_handle.block_on(queries::object_exists_prefix(
+            &store.pool,
+            pg.repo_id,
+            prefix_bytes,
+            byte_len,
+        ));
+
+        match result {
+            Ok(full_oid) => unsafe {
+                ptr::copy_nonoverlapping(
+                    full_oid.as_ptr(),
+                    (*out_oid).id.as_mut_ptr(),
+                    OID_SIZE,
+                );
+                0
+            },
+            Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
+            Err(crate::error::PgGitError::Ambiguous(_)) => raw::GIT_EAMBIGUOUS,
+            Err(_) => -1,
         }
-        return 0;
-    }
-
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
-    let byte_len = ((prefix_len + 1) / 2) as i32;
-    let prefix_bytes = unsafe { &(&(*short_oid).id)[..byte_len as usize] };
-
-    let result = store.rt_handle.block_on(queries::object_exists_prefix(
-        &store.pool,
-        pg.repo_id,
-        prefix_bytes,
-        byte_len,
-    ));
-
-    match result {
-        Ok(full_oid) => unsafe {
-            ptr::copy_nonoverlapping(
-                full_oid.as_ptr(),
-                (*out_oid).id.as_mut_ptr(),
-                OID_SIZE,
-            );
-            0
-        },
-        Err(crate::error::PgGitError::NotFound(_)) => raw::GIT_ENOTFOUND,
-        Err(crate::error::PgGitError::Ambiguous(_)) => raw::GIT_EAMBIGUOUS,
-        Err(_) => -1,
-    }
+    }))
 }
 
 extern "C" fn pg_odb_foreach(
@@ -272,45 +283,45 @@ extern "C" fn pg_odb_foreach(
     cb: raw::git_odb_foreach_cb,
     payload: *mut c_void,
 ) -> i32 {
-    let cb = match cb {
-        Some(f) => f,
-        None => return 0,
-    };
+    catch_panic(AssertUnwindSafe(|| {
+        let cb = match cb {
+            Some(f) => f,
+            None => return 0,
+        };
 
-    let pg = unsafe { get_backend(backend) };
-    let store = pg.store();
+        let pg = unsafe { get_backend(backend) };
+        let store = pg.store();
 
-    let result = store
-        .rt_handle
-        .block_on(queries::all_oids(&store.pool, pg.repo_id));
+        let result = store
+            .rt_handle
+            .block_on(queries::all_oids(&store.pool, pg.repo_id));
 
-    match result {
-        Ok(oids) => {
-            for oid_bytes in &oids {
-                let mut oid: raw::git_oid = unsafe { std::mem::zeroed() };
-                let copy_len = oid_bytes.len().min(OID_SIZE);
-                oid.id[..copy_len].copy_from_slice(&oid_bytes[..copy_len]);
+        match result {
+            Ok(oids) => {
+                for oid_bytes in &oids {
+                    let mut oid: raw::git_oid = unsafe { std::mem::zeroed() };
+                    let copy_len = oid_bytes.len().min(OID_SIZE);
+                    oid.id[..copy_len].copy_from_slice(&oid_bytes[..copy_len]);
 
-                let ret = cb(&oid, payload);
-                if ret != 0 {
-                    return ret;
+                    let ret = cb(&oid, payload);
+                    if ret != 0 {
+                        return ret;
+                    }
                 }
+                0
             }
-            0
+            Err(_) => -1,
         }
-        Err(_) => -1,
-    }
+    }))
 }
 
 extern "C" fn pg_odb_free(backend: *mut raw::git_odb_backend) {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         let pg = backend as *mut PostgresOdbBackend;
-        // Drop the Arc we kept alive
         let arc_ptr = (*pg)._prevent_drop as *mut Arc<PgGitStore>;
         if !arc_ptr.is_null() {
             drop(Box::from_raw(arc_ptr));
         }
-        // Drop the backend itself
         drop(Box::from_raw(pg));
-    }
+    }));
 }

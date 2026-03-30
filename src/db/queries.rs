@@ -392,20 +392,140 @@ pub async fn delete_reflog(pool: &PgPool, repo_id: i32, ref_name: &str) -> Resul
     Ok(())
 }
 
-/// Acquire a PostgreSQL advisory lock scoped to a ref name.
-pub async fn advisory_lock(pool: &PgPool, lock_key: i64) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(lock_key)
-        .execute(pool)
+// ---- Transaction-aware variants for ref writes ----
+//
+// These take a `Transaction` obtained from `pool.begin()`. sqlx handles
+// COMMIT (on `.commit()`) and ROLLBACK (on drop) automatically.
+
+pub type PgTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
+
+/// Read a ref with SELECT FOR UPDATE (holds a row lock within the transaction).
+pub async fn read_ref_for_update(
+    tx: &mut PgTx<'_>,
+    repo_id: i32,
+    name: &str,
+) -> Result<Option<RefRow>> {
+    let row: Option<(String, Option<Vec<u8>>, Option<String>)> = sqlx::query_as(
+        "SELECT name, oid, symbolic FROM refs WHERE repo_id=$1 AND name=$2 FOR UPDATE",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    Ok(row.map(|(name, oid, symbolic)| RefRow {
+        name,
+        oid,
+        symbolic,
+    }))
+}
+
+/// Upsert a direct ref within a transaction.
+pub async fn tx_upsert_direct_ref(
+    tx: &mut PgTx<'_>,
+    repo_id: i32,
+    name: &str,
+    oid: &[u8],
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO refs (repo_id, name, oid, symbolic) \
+         VALUES ($1, $2, $3, NULL) \
+         ON CONFLICT (repo_id, name) DO UPDATE \
+         SET oid = EXCLUDED.oid, symbolic = NULL",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(oid)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Upsert a symbolic ref within a transaction.
+pub async fn tx_upsert_symbolic_ref(
+    tx: &mut PgTx<'_>,
+    repo_id: i32,
+    name: &str,
+    target: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO refs (repo_id, name, oid, symbolic) \
+         VALUES ($1, $2, NULL, $3) \
+         ON CONFLICT (repo_id, name) DO UPDATE \
+         SET oid = NULL, symbolic = EXCLUDED.symbolic",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(target)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Delete a ref within a transaction.
+pub async fn tx_delete_ref(
+    tx: &mut PgTx<'_>,
+    repo_id: i32,
+    name: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM refs WHERE repo_id=$1 AND name=$2")
+        .bind(repo_id)
+        .bind(name)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }
 
-/// Release a PostgreSQL advisory lock.
-pub async fn advisory_unlock(pool: &PgPool, lock_key: i64) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_unlock($1)")
+/// Delete reflog entries within a transaction.
+pub async fn tx_delete_reflog(
+    tx: &mut PgTx<'_>,
+    repo_id: i32,
+    ref_name: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM reflog WHERE repo_id=$1 AND ref_name=$2")
+        .bind(repo_id)
+        .bind(ref_name)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Write a reflog entry within a transaction.
+pub async fn tx_write_reflog_entry(
+    tx: &mut PgTx<'_>,
+    repo_id: i32,
+    ref_name: &str,
+    old_oid: Option<&[u8]>,
+    new_oid: Option<&[u8]>,
+    committer: &str,
+    timestamp_s: i64,
+    tz_offset: &str,
+    message: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO reflog (repo_id, ref_name, old_oid, new_oid, \
+         committer, timestamp_s, tz_offset, message) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(repo_id)
+    .bind(ref_name)
+    .bind(old_oid)
+    .bind(new_oid)
+    .bind(committer)
+    .bind(timestamp_s)
+    .bind(tz_offset)
+    .bind(message)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Acquire a transaction-scoped advisory lock. The lock is released
+/// automatically when the transaction commits or rolls back.
+pub async fn tx_advisory_lock(tx: &mut PgTx<'_>, lock_key: i64) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }

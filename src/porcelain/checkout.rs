@@ -101,8 +101,11 @@ fn replay_commit(
     let local_tree = local.find_tree(tree.id())?;
 
     let parents: Vec<git2::Commit> = (0..commit.parent_count())
-        .map(|i| local.find_commit(commit.parent_id(i).unwrap()).unwrap())
-        .collect();
+        .map(|i| -> std::result::Result<_, PgGitError> {
+            let pid = commit.parent_id(i)?;
+            Ok(local.find_commit(pid)?)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
 
     let author = commit.author();
@@ -146,7 +149,11 @@ fn replay_tree(
                 if local.find_blob(entry.id()).is_err() {
                     let blob = pg_repo.find_blob(entry.id())?;
                     let local_oid = local.blob(blob.content())?;
-                    assert_eq!(local_oid, entry.id());
+                    if local_oid != entry.id() {
+                        return Err(PgGitError::Other(format!(
+                            "blob OID mismatch: local={} pg={}", local_oid, entry.id()
+                        )));
+                    }
                 }
                 tb.insert(name, entry.id(), entry.filemode())?;
             }
@@ -162,7 +169,11 @@ fn replay_tree(
     }
 
     let oid = tb.write()?;
-    assert_eq!(oid, tree.id());
+    if oid != tree.id() {
+        return Err(PgGitError::Other(format!(
+            "tree OID mismatch: local={} pg={}", oid, tree.id()
+        )));
+    }
     Ok(())
 }
 
