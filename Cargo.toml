@@ -1,0 +1,14 @@
+[package]
+name = "pggit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+git2 = "0.20.4"
+libgit2-sys = "0.18"
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
+tokio = { version = "1.50.0", features = ["full"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
