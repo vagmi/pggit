@@ -6,6 +6,7 @@ use tokio::runtime::Handle;
 use crate::backend;
 use crate::db::{queries, schema};
 use crate::error::Result;
+use crate::porcelain::PgRepository;
 
 /// Shared state used by ODB/RefDB backends to access PostgreSQL.
 /// Stored behind an Arc so callbacks can safely reference it.
@@ -54,7 +55,25 @@ impl PgGitStore {
 
     /// Open a git2::Repository backed by PostgreSQL for the given repo_id.
     /// All git2 operations on this repository will read/write to the database.
+    ///
+    /// Note: git2 calls must happen on a blocking thread (e.g. `spawn_blocking`).
+    /// For an async-friendly API, use [`repository()`](Self::repository) instead.
     pub fn open_repository(self: &Arc<Self>, repo_id: i32) -> Result<git2::Repository> {
         backend::repo::open_pg_repo(self, repo_id)
+    }
+
+    /// Get a high-level async repository handle by name.
+    pub async fn repository(self: &Arc<Self>, name: &str) -> Result<PgRepository> {
+        let repo_id = self.get_repository_id(name).await?;
+        Ok(PgRepository::new(Arc::clone(self), repo_id, name.to_string()))
+    }
+
+    /// Get or create a repository, returning a high-level async handle.
+    pub async fn get_or_create_repository(self: &Arc<Self>, name: &str) -> Result<PgRepository> {
+        let repo_id = match self.get_repository_id(name).await {
+            Ok(id) => id,
+            Err(_) => self.create_repository(name).await?,
+        };
+        Ok(PgRepository::new(Arc::clone(self), repo_id, name.to_string()))
     }
 }
