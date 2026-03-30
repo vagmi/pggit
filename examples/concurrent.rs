@@ -4,9 +4,8 @@ use pggit::PgGitStore;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "postgresql://postgres@localhost:17266/postgres".to_string());
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set");
 
     let store = PgGitStore::connect(&database_url).await?;
     store.migrate().await?;
