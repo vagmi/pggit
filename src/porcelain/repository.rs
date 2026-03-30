@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use git2::Oid;
 
 use crate::error::{PgGitError, Result};
-use crate::porcelain::tree;
+use crate::porcelain::{checkout, diff, tree};
+use crate::porcelain::diff::DiffSummary;
 use crate::store::PgGitStore;
 
 /// A high-level async handle to a git repository stored in PostgreSQL.
@@ -232,5 +234,62 @@ impl PgRepository {
             Ok(entries)
         })
         .await
+    }
+
+    /// Compute a diff between two commits (by OID).
+    pub async fn diff(&self, old_oid: Oid, new_oid: Oid) -> Result<DiffSummary> {
+        self.with_repo(move |repo| diff::diff_commits(repo, old_oid, new_oid))
+            .await
+    }
+
+    /// Compute a diff for an initial commit (against empty tree).
+    pub async fn diff_initial(&self, oid: Oid) -> Result<DiffSummary> {
+        self.with_repo(move |repo| diff::diff_initial_commit(repo, oid))
+            .await
+    }
+
+    /// Diff between the tips of two branches (or refnames).
+    pub async fn diff_refs(&self, old_ref: &str, new_ref: &str) -> Result<DiffSummary> {
+        let old_ref = normalize_ref(old_ref);
+        let new_ref = normalize_ref(new_ref);
+
+        self.with_repo(move |repo| {
+            let old_oid = repo
+                .find_reference(&old_ref)?
+                .peel_to_commit()?
+                .id();
+            let new_oid = repo
+                .find_reference(&new_ref)?
+                .peel_to_commit()?
+                .id();
+            diff::diff_commits(repo, old_oid, new_oid)
+        })
+        .await
+    }
+
+    /// Checkout the repository at a given ref to a local directory.
+    ///
+    /// The directory will contain all files from the commit's tree,
+    /// plus a `.git` directory so standard git CLI tools work.
+    pub async fn checkout(&self, refname: &str, dest: &str) -> Result<()> {
+        let refname = normalize_ref(refname);
+        let dest = PathBuf::from(dest);
+
+        self.with_repo(move |repo| {
+            let reference = repo.find_reference(&refname)?;
+            let oid = reference
+                .target()
+                .ok_or_else(|| PgGitError::Other("symbolic ref".into()))?;
+            checkout::checkout_to(repo, oid, &dest)
+        })
+        .await
+    }
+}
+
+fn normalize_ref(refname: &str) -> String {
+    if refname.starts_with("refs/") {
+        refname.to_string()
+    } else {
+        format!("refs/heads/{}", refname)
     }
 }
