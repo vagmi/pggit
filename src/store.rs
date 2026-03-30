@@ -47,6 +47,11 @@ impl PgGitStore {
         queries::get_repository_id(&self.pool, name).await
     }
 
+    /// Get a reference to the underlying connection pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Open a git2::Repository backed by PostgreSQL for the given repo_id.
     /// All git2 operations on this repository will read/write to the database.
     pub fn open_repository(self: &Arc<Self>, repo_id: i32) -> Result<git2::Repository> {
