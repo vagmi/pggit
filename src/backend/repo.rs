@@ -1,5 +1,5 @@
 use std::ptr;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use libgit2_sys as raw;
 
@@ -8,18 +8,14 @@ use crate::backend::refdb::PostgresRefdbBackend;
 use crate::error::{PgGitError, Result};
 use crate::store::PgGitStore;
 
-static LIBGIT2_INIT: Once = Once::new();
-
 /// Create a `git2::Repository` backed by PostgreSQL for the given repo.
 ///
 /// The returned repository has custom ODB and RefDB backends that
 /// read/write objects and refs to PostgreSQL.
 pub fn open_pg_repo(store: &Arc<PgGitStore>, repo_id: i32) -> Result<git2::Repository> {
     unsafe {
-        // Ensure libgit2 is initialized exactly once (thread-safe)
-        LIBGIT2_INIT.call_once(|| {
-            raw::git_libgit2_init();
-        });
+        // Ensure libgit2 is initialized (safe to call multiple times, ref-counted)
+        raw::git_libgit2_init();
 
         // Create a new empty repository (no filesystem backing)
         let mut repo_ptr: *mut raw::git_repository = ptr::null_mut();
