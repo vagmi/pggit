@@ -77,11 +77,13 @@ extern "C" fn pg_odb_read(
         let pg = unsafe { get_backend(backend) };
         let store = pg.store();
         let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+        let repo_id = pg.repo_id;
+        let oid_owned: Vec<u8> = oid_bytes.to_vec();
+        let pool = store.pool.clone();
 
-        let result =
-            store
-                .rt_handle
-                .block_on(queries::read_object(&store.pool, pg.repo_id, oid_bytes));
+        let result = store.block_on_async(async move {
+            queries::read_object(&pool, repo_id, &oid_owned).await
+        });
 
         match result {
             Ok(row) => unsafe {
@@ -115,12 +117,13 @@ extern "C" fn pg_odb_read_header(
         let pg = unsafe { get_backend(backend) };
         let store = pg.store();
         let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+        let repo_id = pg.repo_id;
+        let oid_owned: Vec<u8> = oid_bytes.to_vec();
+        let pool = store.pool.clone();
 
-        let result = store.rt_handle.block_on(queries::read_object_header(
-            &store.pool,
-            pg.repo_id,
-            oid_bytes,
-        ));
+        let result = store.block_on_async(async move {
+            queries::read_object_header(&pool, repo_id, &oid_owned).await
+        });
 
         match result {
             Ok((obj_type, size)) => unsafe {
@@ -156,13 +159,13 @@ extern "C" fn pg_odb_read_prefix(
         let store = pg.store();
         let byte_len = ((prefix_len + 1) / 2) as i32;
         let prefix_bytes = unsafe { &(&(*short_oid).id)[..byte_len as usize] };
+        let repo_id = pg.repo_id;
+        let prefix_owned: Vec<u8> = prefix_bytes.to_vec();
+        let pool = store.pool.clone();
 
-        let result = store.rt_handle.block_on(queries::read_object_prefix(
-            &store.pool,
-            pg.repo_id,
-            prefix_bytes,
-            byte_len,
-        ));
+        let result = store.block_on_async(async move {
+            queries::read_object_prefix(&pool, repo_id, &prefix_owned, byte_len).await
+        });
 
         match result {
             Ok(row) => unsafe {
@@ -200,15 +203,14 @@ extern "C" fn pg_odb_write(
         let store = pg.store();
         let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
         let content = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+        let repo_id = pg.repo_id;
+        let oid_owned: Vec<u8> = oid_bytes.to_vec();
+        let content_owned: Vec<u8> = content.to_vec();
+        let pool = store.pool.clone();
 
-        let result = store.rt_handle.block_on(queries::write_object(
-            &store.pool,
-            pg.repo_id,
-            oid_bytes,
-            obj_type as i16,
-            len as i32,
-            content,
-        ));
+        let result = store.block_on_async(async move {
+            queries::write_object(&pool, repo_id, &oid_owned, obj_type as i16, len as i32, &content_owned).await
+        });
 
         match result {
             Ok(()) => 0,
@@ -222,10 +224,13 @@ extern "C" fn pg_odb_exists(backend: *mut raw::git_odb_backend, oid: *const raw:
         let pg = unsafe { get_backend(backend) };
         let store = pg.store();
         let oid_bytes = unsafe { &(&(*oid).id)[..OID_SIZE] };
+        let repo_id = pg.repo_id;
+        let oid_owned: Vec<u8> = oid_bytes.to_vec();
+        let pool = store.pool.clone();
 
-        let result = store
-            .rt_handle
-            .block_on(queries::object_exists(&store.pool, pg.repo_id, oid_bytes));
+        let result = store.block_on_async(async move {
+            queries::object_exists(&pool, repo_id, &oid_owned).await
+        });
 
         match result {
             Ok(true) => 1,
@@ -254,13 +259,13 @@ extern "C" fn pg_odb_exists_prefix(
         let store = pg.store();
         let byte_len = ((prefix_len + 1) / 2) as i32;
         let prefix_bytes = unsafe { &(&(*short_oid).id)[..byte_len as usize] };
+        let repo_id = pg.repo_id;
+        let prefix_owned: Vec<u8> = prefix_bytes.to_vec();
+        let pool = store.pool.clone();
 
-        let result = store.rt_handle.block_on(queries::object_exists_prefix(
-            &store.pool,
-            pg.repo_id,
-            prefix_bytes,
-            byte_len,
-        ));
+        let result = store.block_on_async(async move {
+            queries::object_exists_prefix(&pool, repo_id, &prefix_owned, byte_len).await
+        });
 
         match result {
             Ok(full_oid) => unsafe {
@@ -291,10 +296,12 @@ extern "C" fn pg_odb_foreach(
 
         let pg = unsafe { get_backend(backend) };
         let store = pg.store();
+        let repo_id = pg.repo_id;
+        let pool = store.pool.clone();
 
-        let result = store
-            .rt_handle
-            .block_on(queries::all_oids(&store.pool, pg.repo_id));
+        let result = store.block_on_async(async move {
+            queries::all_oids(&pool, repo_id).await
+        });
 
         match result {
             Ok(oids) => {

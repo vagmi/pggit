@@ -1,35 +1,83 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tokio::runtime::Handle;
 
 use crate::backend;
 use crate::db::{queries, schema};
 use crate::error::Result;
 use crate::porcelain::PgRepository;
 
+/// A dedicated tokio runtime for running async queries from FFI callbacks.
+/// Each PgGitStore owns one. FFI callbacks call `handle.block_on()` to
+/// run async SQL queries without depending on the caller's runtime.
+pub(crate) struct FfiRuntime {
+    handle: tokio::runtime::Handle,
+    // Wrapped in Option so we can take it in Drop and shut down on a separate thread.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl FfiRuntime {
+    fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed to create pggit internal runtime");
+        let handle = runtime.handle().clone();
+        Self {
+            handle,
+            runtime: Some(runtime),
+        }
+    }
+}
+
+impl Drop for FfiRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            // Shutdown on a separate thread to avoid "Cannot drop a runtime
+            // in a context where blocking is not allowed" when dropped from async.
+            let _ = std::thread::spawn(move || drop(rt)).join();
+        }
+    }
+}
+
 /// Shared state used by ODB/RefDB backends to access PostgreSQL.
 /// Stored behind an Arc so callbacks can safely reference it.
+///
+/// Database queries from FFI callbacks are dispatched to a dedicated
+/// worker thread with its own tokio runtime, avoiding deadlocks with
+/// the caller's runtime.
 pub struct PgGitStore {
     pub(crate) pool: PgPool,
-    pub(crate) rt_handle: Handle,
+    pub(crate) ffi_runtime: FfiRuntime,
 }
 
 impl PgGitStore {
+    /// Run an async future on the dedicated runtime, blocking the current thread.
+    /// Safe to call from FFI callbacks running on `spawn_blocking` threads.
+    /// The future does NOT need to be `Send` — it runs on the calling thread
+    /// but is driven by the store's dedicated runtime.
+    pub(crate) fn block_on_async<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.ffi_runtime.handle.block_on(f)
+    }
+
     /// Connect to PostgreSQL and return a store.
     pub async fn connect(database_url: &str) -> Result<Arc<Self>> {
         let pool = PgPool::connect(database_url).await?;
         Ok(Arc::new(Self {
+            ffi_runtime: FfiRuntime::new(),
             pool,
-            rt_handle: Handle::current(),
         }))
     }
 
     /// Create a store from an existing pool.
     pub fn from_pool(pool: PgPool) -> Arc<Self> {
         Arc::new(Self {
+            ffi_runtime: FfiRuntime::new(),
             pool,
-            rt_handle: Handle::current(),
         })
     }
 
