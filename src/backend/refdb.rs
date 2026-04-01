@@ -191,7 +191,7 @@ extern "C" fn pg_refdb_exists(
     let store = pg.store();
     let name = unsafe { CStr::from_ptr(ref_name) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(queries::ref_exists(&store.pool, pg.repo_id, name));
+    let result = store.block_on(queries::ref_exists(&store.pool, pg.repo_id, name));
 
     match result {
         Ok(found) => {
@@ -211,7 +211,7 @@ extern "C" fn pg_refdb_lookup(
     let store = pg.store();
     let name = unsafe { CStr::from_ptr(ref_name) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(queries::read_ref(&store.pool, pg.repo_id, name));
+    let result = store.block_on(queries::read_ref(&store.pool, pg.repo_id, name));
 
     match result {
         Ok(row) => {
@@ -248,7 +248,7 @@ extern "C" fn pg_refdb_iterator(
         None
     };
 
-    let result = store.block_on_async(queries::list_refs(
+    let result = store.block_on(queries::list_refs(
         &store.pool,
         pg.repo_id,
         like_pattern.as_deref(),
@@ -297,7 +297,7 @@ extern "C" fn pg_refdb_write(
 
     // Everything runs in a proper sqlx transaction. On success we call
     // tx.commit(); on error the transaction is rolled back on drop.
-    let result = store.block_on_async(async {
+    let result = store.block_on(async {
         let mut tx = store.pool.begin().await?;
 
         if force == 0 {
@@ -448,7 +448,7 @@ extern "C" fn pg_refdb_rename(
     let old = unsafe { CStr::from_ptr(old_name) }.to_str().unwrap_or("");
     let new = unsafe { CStr::from_ptr(new_name) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(async {
+    let result = store.block_on(async {
         if force == 0 {
             if queries::ref_exists(&store.pool, pg.repo_id, new).await? {
                 return Err(crate::error::PgGitError::Other(
@@ -496,7 +496,7 @@ extern "C" fn pg_refdb_del(
     let store = pg.store();
     let name = unsafe { CStr::from_ptr(ref_name) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(async {
+    let result = store.block_on(async {
         queries::delete_ref(&store.pool, pg.repo_id, name).await?;
         queries::delete_reflog(&store.pool, pg.repo_id, name).await?;
         Ok::<(), crate::error::PgGitError>(())
@@ -516,7 +516,7 @@ extern "C" fn pg_refdb_has_log(
     let store = pg.store();
     let name = unsafe { CStr::from_ptr(refname) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(queries::has_reflog(&store.pool, pg.repo_id, name));
+    let result = store.block_on(queries::has_reflog(&store.pool, pg.repo_id, name));
 
     match result {
         Ok(true) => 1,
@@ -560,7 +560,7 @@ extern "C" fn pg_refdb_reflog_rename(
     let old = unsafe { CStr::from_ptr(old_name) }.to_str().unwrap_or("");
     let new = unsafe { CStr::from_ptr(new_name) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(queries::rename_reflog(&store.pool, pg.repo_id, old, new));
+    let result = store.block_on(queries::rename_reflog(&store.pool, pg.repo_id, old, new));
 
     match result {
         Ok(()) => 0,
@@ -576,7 +576,7 @@ extern "C" fn pg_refdb_reflog_delete(
     let store = pg.store();
     let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
 
-    let result = store.block_on_async(queries::delete_reflog(&store.pool, pg.repo_id, name));
+    let result = store.block_on(queries::delete_reflog(&store.pool, pg.repo_id, name));
 
     match result {
         Ok(()) => 0,
@@ -605,7 +605,7 @@ extern "C" fn pg_refdb_lock(
     let name = unsafe { CStr::from_ptr(refname) }.to_str().unwrap_or("");
     let lock_key = hash_refname(pg.repo_id, name);
 
-    let result = store.block_on_async(async {
+    let result = store.block_on(async {
         let mut tx = store.pool.begin().await?;
         queries::tx_advisory_lock(&mut tx, lock_key).await?;
         Ok::<_, crate::error::PgGitError>(tx)
@@ -642,7 +642,7 @@ extern "C" fn pg_refdb_unlock(
     let lock = unsafe { Box::from_raw(payload as *mut PgRefLock) };
     let mut tx = unsafe { Box::from_raw(lock.tx) };
 
-    let result = store.block_on_async(async {
+    let result = store.block_on(async {
         if success == 1 {
             // Write/update the ref within the locked transaction
             let ref_name = unsafe { CStr::from_ptr(raw::git_reference_name(ref_)) }
