@@ -491,8 +491,70 @@ async fn checkout_git_diff_matches_our_diff() {
 }
 
 // ============================================================
-// Concurrent access test
+// Concurrent access tests
 // ============================================================
+
+/// Mirrors the uraijs-server test_history pattern: init repo with scaffold files,
+/// then make multiple commits and read history — all happening concurrently
+/// across many repos.
+#[tokio::test]
+async fn concurrent_init_commit_history() {
+    let store = store().await;
+
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let name = format!("concurrent-hist-{}-{}", i, std::process::id());
+            let repo = store.get_or_create_repository(&name).await.unwrap();
+
+            // Init with scaffold (like ToolFileStore::init_tool)
+            repo.commit(
+                "main",
+                &[
+                    ("tool.ts", b"// starter tool\n" as &[u8]),
+                    ("declarations.ts", b"// auto-generated\n"),
+                ],
+                "Initial tool scaffold",
+                "uraijs-server",
+                "uraijs@urai.ai",
+            )
+            .await
+            .unwrap();
+
+            // Make several updates (like save_file)
+            for v in 0..5 {
+                let content = format!("// tool version {}\n", v);
+                repo.commit(
+                    "main",
+                    &[("tool.ts", content.as_bytes())],
+                    &format!("Update tool.ts"),
+                    "uraijs-server",
+                    "uraijs@urai.ai",
+                )
+                .await
+                .unwrap();
+            }
+
+            // Read history (like ToolFileStore::history)
+            let log = repo.log("main", 50).await.unwrap();
+            assert_eq!(log.len(), 6, "repo {} has wrong commit count: {}", i, log.len());
+            assert_eq!(log[0].message.trim(), "Update tool.ts");
+
+            // Read current file
+            let content = repo.read_file("main", "tool.ts").await.unwrap().unwrap();
+            assert_eq!(content, b"// tool version 4\n");
+
+            // List files
+            let files = repo.list_files("main").await.unwrap();
+            assert_eq!(files.len(), 2);
+        }));
+    }
+
+    for (i, h) in handles.into_iter().enumerate() {
+        h.await.unwrap_or_else(|e| panic!("repo {} panicked: {:?}", i, e));
+    }
+}
 
 #[tokio::test]
 async fn concurrent_repos_no_interference() {
