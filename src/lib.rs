@@ -5,6 +5,9 @@ pub mod porcelain;
 pub mod store;
 pub mod types;
 
+#[cfg(feature = "smart-http")]
+pub mod http;
+
 pub use error::{PgGitError, Result};
 pub use porcelain::{DiffFile, DiffHunk, DiffLine, DiffStats, DiffStatus, DiffSummary, LogEntry, PgRepository};
 pub use store::PgGitStore;

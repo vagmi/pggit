@@ -97,6 +97,15 @@ impl PgGitStore {
         queries::get_repository_id(&self.pool, name).await
     }
 
+    /// Look up a repository by name, returning `None` if it doesn't exist.
+    pub async fn lookup_repository(&self, name: &str) -> Result<Option<i32>> {
+        match queries::get_repository_id(&self.pool, name).await {
+            Ok(id) => Ok(Some(id)),
+            Err(crate::error::PgGitError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get a reference to the underlying connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
