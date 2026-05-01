@@ -4,8 +4,10 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::Deserialize;
 
+use super::cgi::{self, CgiCall};
 use super::error::HttpError;
 use super::state::HttpState;
+use super::workdir::{self, Workdir};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct InfoRefsQuery {
@@ -29,37 +31,120 @@ pub(crate) async fn info_refs(
         return Err(HttpError::PushDisabled);
     }
 
-    let _repo_id = resolve_repo(&state, &repo).await?;
+    tracing::info!(repo = %repo, %service, "smart-http: info/refs");
 
-    // TODO: workdir checkout + CGI dispatch.
-    Err(HttpError::Internal(format!(
-        "info_refs not yet implemented (service={service})"
-    )))
+    let repo_id = resolve_repo(&state, &repo).await?;
+    let workdir = Workdir::prepare(&state, repo_id).await?;
+
+    let path_info = format!("/{}/info/refs", workdir::REPO_DIR_NAME);
+    let qs = format!("service={service}");
+    let call = CgiCall {
+        git_binary: &state.opts.git_binary,
+        git_dir: workdir.git_dir(),
+        path_info: &path_info,
+        query_string: &qs,
+        method: "GET",
+        content_type: None,
+        remote_addr: None,
+        content_length: None,
+    };
+
+    cgi::run_buffered(call, Body::empty()).await
 }
 
-#[tracing::instrument(skip(state, _headers, _body), fields(repo = %repo))]
+#[tracing::instrument(skip(state, headers, body), fields(repo = %repo))]
 pub(crate) async fn upload_pack(
     State(state): State<HttpState>,
     Path(repo): Path<String>,
-    _headers: HeaderMap,
-    _body: Body,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<Response, HttpError> {
-    let _repo_id = resolve_repo(&state, &repo).await?;
-    Err(HttpError::Internal("upload_pack not yet implemented".into()))
+    tracing::info!(repo = %repo, "smart-http: upload-pack");
+
+    let repo_id = resolve_repo(&state, &repo).await?;
+    let workdir = Workdir::prepare(&state, repo_id).await?;
+
+    let path_info = format!("/{}/git-upload-pack", workdir::REPO_DIR_NAME);
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let content_length = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    // Keep the workdir alive until the streaming body finishes — otherwise
+    // the tempdir gets reaped while git http-backend is still using it.
+    let keep_alive: cgi::KeepAlive = Box::new(workdir);
+    // Borrow git_dir back out of the boxed workdir.
+    let workdir_ref: &Workdir = keep_alive.downcast_ref().expect("just boxed Workdir");
+    let git_dir = workdir_ref.git_dir().to_path_buf();
+
+    let call = CgiCall {
+        git_binary: &state.opts.git_binary,
+        git_dir: &git_dir,
+        path_info: &path_info,
+        query_string: "",
+        method: "POST",
+        content_type: content_type.as_deref(),
+        remote_addr: None,
+        content_length,
+    };
+
+    cgi::run_streaming(call, body, Some(keep_alive)).await
 }
 
-#[tracing::instrument(skip(state, _headers, _body), fields(repo = %repo))]
+#[tracing::instrument(skip(state, headers, body), fields(repo = %repo))]
 pub(crate) async fn receive_pack(
     State(state): State<HttpState>,
     Path(repo): Path<String>,
-    _headers: HeaderMap,
-    _body: Body,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<Response, HttpError> {
+    tracing::info!(repo = %repo, "smart-http: receive-pack");
+
     if !state.opts.allow_push {
         return Err(HttpError::PushDisabled);
     }
-    let _repo_id = resolve_repo(&state, &repo).await?;
-    Err(HttpError::Internal("receive_pack not yet implemented".into()))
+    let repo_id = resolve_repo(&state, &repo).await?;
+
+    // Serialize all pushes within a process. (k8s single-replica assumption;
+    // multi-replica setups need PG advisory locks instead.)
+    let _push_guard = state.push_lock.lock().await;
+
+    let workdir = Workdir::prepare(&state, repo_id).await?;
+    let before = workdir.snapshot().await?;
+    tracing::debug!(repo = %repo, "snapshot taken before receive-pack");
+
+    let path_info = format!("/{}/git-receive-pack", workdir::REPO_DIR_NAME);
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let content_length = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let call = CgiCall {
+        git_binary: &state.opts.git_binary,
+        git_dir: workdir.git_dir(),
+        path_info: &path_info,
+        query_string: "",
+        method: "POST",
+        content_type: content_type.as_deref(),
+        remote_addr: None,
+        content_length,
+    };
+
+    let resp = cgi::run_buffered(call, body).await?;
+    tracing::debug!(repo = %repo, "receive-pack CGI complete; reimporting");
+
+    workdir.apply_changes(&state, repo_id, before).await?;
+    tracing::info!(repo = %repo, "receive-pack: reimport done");
+
+    Ok(resp)
 }
 
 async fn resolve_repo(state: &HttpState, name: &str) -> Result<i32, HttpError> {

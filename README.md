@@ -5,12 +5,6 @@ A Rust library that stores Git repositories in PostgreSQL. Built for application
 pggit implements custom [libgit2](https://libgit2.org/) ODB and RefDB backends via FFI, so every git object (blob, tree, commit, tag) and every ref lives in PostgreSQL tables. On top of this, it provides an async porcelain API for the common operations: commit files, read files, view history, compute diffs, and checkout to a local directory.
 
 
-> AI Disclaimer - this project was created in collaboration with coding agents. While it is not
-> entirely vibe-coded in the tradition sense, it has been heavily influenced by AI coding patterns. 
-> I built a core version in C directly working with libgit2 and sort of ported it to Rust with
-> Claude Code's help
-
-
 I sort of wanted something like FossilSCM but on top of the git tooling. Et voila. If you have
 tons of tiny git repos, pggit might be better than git.
 

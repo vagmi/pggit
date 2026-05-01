@@ -30,6 +30,10 @@ impl Default for HttpOptions {
 pub struct HttpState {
     pub(crate) store: Arc<PgGitStore>,
     pub(crate) opts: Arc<HttpOptions>,
+    /// Process-local mutex serializing `git-receive-pack` flows so the
+    /// snapshot/CGI/reimport cycle is atomic per process. Multi-replica
+    /// deployments need a stronger lock (PG advisory).
+    pub(crate) push_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HttpState {
@@ -37,6 +41,7 @@ impl HttpState {
         Self {
             store,
             opts: Arc::new(HttpOptions::default()),
+            push_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -44,6 +49,7 @@ impl HttpState {
         Self {
             store,
             opts: Arc::new(opts),
+            push_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
