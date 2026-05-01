@@ -8,11 +8,10 @@
 //! No auth is included. The router assumes that any request that reaches it
 //! is authorized; compose authentication as a [`tower::Layer`] in your app.
 
-mod cgi;
 mod error;
+mod proto;
 mod routes;
 mod state;
-mod workdir;
 
 pub use error::HttpError;
 pub use state::{HttpOptions, HttpState};

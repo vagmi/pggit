@@ -4,10 +4,11 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::Deserialize;
 
-use super::cgi::{self, CgiCall};
+use std::sync::Arc;
+
 use super::error::HttpError;
+use super::proto::{self, Service};
 use super::state::HttpState;
-use super::workdir::{self, Workdir};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct InfoRefsQuery {
@@ -22,84 +23,85 @@ pub(crate) async fn info_refs(
     _headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let service = match q.service.as_deref() {
-        Some(s @ ("git-upload-pack" | "git-receive-pack")) => s.to_string(),
+        Some("git-upload-pack") => Service::UploadPack,
+        Some("git-receive-pack") => Service::ReceivePack,
         Some(other) => return Err(HttpError::BadRequest(format!("unknown service {other}"))),
         None => return Err(HttpError::BadRequest("missing ?service=".into())),
     };
 
-    if service == "git-receive-pack" && !state.opts.allow_push {
+    if service == Service::ReceivePack && !state.opts.allow_push {
         return Err(HttpError::PushDisabled);
     }
 
-    tracing::info!(repo = %repo, %service, "smart-http: info/refs");
+    tracing::info!(repo = %repo, service = service.name(), "smart-http: info/refs");
 
     let repo_id = resolve_repo(&state, &repo).await?;
-    let workdir = Workdir::prepare(&state, repo_id).await?;
 
-    let path_info = format!("/{}/info/refs", workdir::REPO_DIR_NAME);
-    let qs = format!("service={service}");
-    let call = CgiCall {
-        git_binary: &state.opts.git_binary,
-        git_dir: workdir.git_dir(),
-        path_info: &path_info,
-        query_string: &qs,
-        method: "GET",
-        content_type: None,
-        remote_addr: None,
-        content_length: None,
-    };
+    let store = Arc::clone(&state.store);
+    let bytes = tokio::task::spawn_blocking(move || proto::advert::build(&store, repo_id, service))
+        .await
+        .map_err(|e| HttpError::Internal(format!("advert join: {e}")))??;
 
-    cgi::run_buffered(call, Body::empty()).await
+    let resp = Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            proto::advert::content_type(service),
+        )
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(bytes))
+        .map_err(|e| HttpError::Internal(format!("response build: {e}")))?;
+    Ok(resp)
 }
 
-#[tracing::instrument(skip(state, headers, body), fields(repo = %repo))]
+/// Upper bound on the in-memory request body buffer for upload/receive
+/// pack POSTs. 256 MiB is generous for the coding-agent use case and
+/// refuses absurd payloads.
+const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024;
+
+#[tracing::instrument(skip(state, _headers, body), fields(repo = %repo))]
 pub(crate) async fn upload_pack(
     State(state): State<HttpState>,
     Path(repo): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
     tracing::info!(repo = %repo, "smart-http: upload-pack");
 
     let repo_id = resolve_repo(&state, &repo).await?;
-    let workdir = Workdir::prepare(&state, repo_id).await?;
 
-    let path_info = format!("/{}/git-upload-pack", workdir::REPO_DIR_NAME);
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let content_length = headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
+    let body_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY)
+        .await
+        .map_err(|e| HttpError::BadRequest(format!("read body: {e}")))?;
 
-    // Keep the workdir alive until the streaming body finishes — otherwise
-    // the tempdir gets reaped while git http-backend is still using it.
-    let keep_alive: cgi::KeepAlive = Box::new(workdir);
-    // Borrow git_dir back out of the boxed workdir.
-    let workdir_ref: &Workdir = keep_alive.downcast_ref().expect("just boxed Workdir");
-    let git_dir = workdir_ref.git_dir().to_path_buf();
+    let store = Arc::clone(&state.store);
+    let (sync_writer, async_reader) = tokio::io::duplex(64 * 1024);
+    let writer_bridge = tokio_util::io::SyncIoBridge::new(sync_writer);
 
-    let call = CgiCall {
-        git_binary: &state.opts.git_binary,
-        git_dir: &git_dir,
-        path_info: &path_info,
-        query_string: "",
-        method: "POST",
-        content_type: content_type.as_deref(),
-        remote_addr: None,
-        content_length,
-    };
+    tokio::task::spawn_blocking(move || {
+        let request = std::io::Cursor::new(body_bytes);
+        if let Err(e) = proto::upload_pack::run(store, repo_id, request, writer_bridge) {
+            tracing::error!(error = %e, "upload-pack: protocol failure");
+        }
+    });
 
-    cgi::run_streaming(call, body, Some(keep_alive)).await
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(async_reader));
+    Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-git-upload-pack-result",
+        )
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .map_err(|e| HttpError::Internal(format!("response build: {e}")))
 }
 
-#[tracing::instrument(skip(state, headers, body), fields(repo = %repo))]
+#[tracing::instrument(skip(state, _headers, body), fields(repo = %repo))]
 pub(crate) async fn receive_pack(
     State(state): State<HttpState>,
     Path(repo): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
     tracing::info!(repo = %repo, "smart-http: receive-pack");
@@ -113,38 +115,35 @@ pub(crate) async fn receive_pack(
     // multi-replica setups need PG advisory locks instead.)
     let _push_guard = state.push_lock.lock().await;
 
-    let workdir = Workdir::prepare(&state, repo_id).await?;
-    let before = workdir.snapshot().await?;
-    tracing::debug!(repo = %repo, "snapshot taken before receive-pack");
+    let body_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY)
+        .await
+        .map_err(|e| HttpError::BadRequest(format!("read body: {e}")))?;
 
-    let path_info = format!("/{}/git-receive-pack", workdir::REPO_DIR_NAME);
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let content_length = headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
+    let store = Arc::clone(&state.store);
+    let report_bytes: Vec<u8> = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, HttpError> {
+        let mut response = Vec::with_capacity(256);
+        proto::receive_pack::run(
+            store,
+            repo_id,
+            std::io::Cursor::new(body_bytes),
+            &mut response,
+        )?;
+        Ok(response)
+    })
+    .await
+    .map_err(|e| HttpError::Internal(format!("receive-pack join: {e}")))??;
 
-    let call = CgiCall {
-        git_binary: &state.opts.git_binary,
-        git_dir: workdir.git_dir(),
-        path_info: &path_info,
-        query_string: "",
-        method: "POST",
-        content_type: content_type.as_deref(),
-        remote_addr: None,
-        content_length,
-    };
+    tracing::info!(repo = %repo, "receive-pack: complete");
 
-    let resp = cgi::run_buffered(call, body).await?;
-    tracing::debug!(repo = %repo, "receive-pack CGI complete; reimporting");
-
-    workdir.apply_changes(&state, repo_id, before).await?;
-    tracing::info!(repo = %repo, "receive-pack: reimport done");
-
-    Ok(resp)
+    Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-git-receive-pack-result",
+        )
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(report_bytes))
+        .map_err(|e| HttpError::Internal(format!("response build: {e}")))
 }
 
 async fn resolve_repo(state: &HttpState, name: &str) -> Result<i32, HttpError> {

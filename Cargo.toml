@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-smart-http = ["dep:axum", "dep:tower", "dep:tower-http", "dep:bytes", "dep:futures", "dep:tempfile", "dep:serde", "dep:tokio-util"]
+smart-http = ["dep:axum", "dep:tempfile", "dep:serde", "dep:tokio-util", "dep:gix-packetline"]
 
 [dependencies]
 git2 = "0.20.4"
@@ -17,13 +17,10 @@ tracing = "0.1"
 
 # smart-http feature
 axum       = { version = "0.8", optional = true }
-tower      = { version = "0.5", optional = true }
-tower-http = { version = "0.6", features = ["trace"], optional = true }
-bytes      = { version = "1", optional = true }
-futures    = { version = "0.3", optional = true }
 tempfile   = { version = "3", optional = true }
 serde      = { version = "1", features = ["derive"], optional = true }
-tokio-util = { version = "0.7", features = ["io"], optional = true }
+tokio-util = { version = "0.7", features = ["io", "io-util"], optional = true }
+gix-packetline = { version = "0.21.3", features = ["blocking-io"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

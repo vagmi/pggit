@@ -115,6 +115,65 @@ let stat  = diff.stat_line();                                  // "3 file(s) cha
 repo.checkout("main", "/tmp/workdir").await?;
 ```
 
+### Smart HTTP (clone / fetch / push from the git CLI)
+
+Behind the `smart-http` feature, pggit exposes an `axum::Router` that speaks
+the git smart HTTP protocol. Coding agents and shell scripts can use the
+standard `git` CLI against PG-backed repos.
+
+```toml
+[dependencies]
+pggit = { git = "https://github.com/vagmi/pggit.git", features = ["smart-http"] }
+axum  = "0.8"
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use std::sync::Arc;
+use axum::Router;
+use pggit::{PgGitStore, http::{HttpState, router}};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store: Arc<PgGitStore> = PgGitStore::connect("postgresql://...").await?;
+    store.migrate().await?;
+
+    // The git router exposes /:repo/info/refs, /:repo/git-upload-pack,
+    // and /:repo/git-receive-pack. Nest it under whatever prefix you want.
+    let git = router(HttpState::new(store));
+    let app = Router::new().nest("/git", git);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+```
+
+Then, from anywhere with network reach:
+
+```bash
+git clone http://your-host:8080/git/<repo-name>
+cd <repo-name>
+# ... edit, commit ...
+git push origin main
+```
+
+**Auth is the consumer's job.** The router does no authentication checks — it
+assumes any request that reaches it is authorized. Compose authentication as
+a `tower::Layer` using whatever scheme you want (bearer token, mTLS, OIDC,
+your existing middleware). See [`examples/smart_http_server.rs`][ex] for a
+minimal `Authorization: Bearer` example.
+
+[ex]: examples/smart_http_server.rs
+
+**How it works.** Pure in-process — no subprocess, no per-request bare-repo
+materialization. The handlers parse pkt-lines with `gix-packetline`, build
+fetch responses with libgit2's `PackBuilder` reading directly from the PG
+ODB, and accept push packs through libgit2's `Indexer` (which validates the
+pack into a small tempdir, after which we copy each object into PG via the
+existing ODB write path). Per-process push serialization uses an in-memory
+mutex; multi-replica deployments need stronger locking.
+
 ### Low-level git2 access
 
 For operations not covered by the porcelain API, you can drop down to the full [git2](https://docs.rs/git2) API:
@@ -206,7 +265,7 @@ The custom backends translate libgit2's storage calls into SQL queries. Since li
 ### When filesystem git is better
 
 - **Large repos**. Git's packfile format uses delta compression -- a 1 GB repo might only take 100 MB on disk. pggit stores every object at full size in the `objects` table. A repo with 1000 versions of a 10 KB file stores 1000 x 10 KB = 10 MB of blobs. With git packfiles, that might be 500 KB.
-- **Clone/push over the network**. pggit doesn't implement the git pack protocol. You can't `git push` to it or `git clone` from it (yet). Use `checkout()` to materialize to a filesystem repo if you need CLI interop.
+- **High-throughput clone/push**. The smart-HTTP server (behind the `smart-http` feature) is in-process — it builds pack data on demand from PG via libgit2 rather than serving a precomputed packfile. That's fine for coding-agent shell scripts and small repos, but a real git server fronting filesystem packfiles will still be faster for big-repo / many-client hosting.
 - **Heavy concurrent writes to the same branch**. Ref updates use `SELECT FOR UPDATE` with transaction-scoped advisory locks. This serializes concurrent writes to the same ref. Different repos or different branches are fully parallel.
 
 ### Storage overhead
@@ -226,9 +285,12 @@ Integration tests require a PostgreSQL instance:
 ```bash
 export DATABASE_URL="postgresql://postgres@localhost:5432/pggit_test"
 cargo test --test integration
+
+# Smart HTTP tests (gated on the feature flag):
+cargo test --features smart-http --test smart_http
 ```
 
-The tests create isolated repos (unique names per test run) and validate compatibility using the `git` CLI binary -- checking that `git log`, `git status`, `git cat-file`, and `git diff` all produce correct results on checked-out repos.
+The tests create isolated repos (unique names per test run) and validate compatibility using the `git` CLI binary -- checking that `git log`, `git status`, `git cat-file`, and `git diff` all produce correct results on checked-out repos. The smart-HTTP tests additionally drive real `git clone` / `git push` through the in-process axum server.
 
 ## Acknowledgements
 

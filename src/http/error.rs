@@ -25,6 +25,12 @@ pub enum HttpError {
     Io(#[from] std::io::Error),
 }
 
+impl From<git2::Error> for HttpError {
+    fn from(e: git2::Error) -> Self {
+        HttpError::PgGit(e.into())
+    }
+}
+
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
